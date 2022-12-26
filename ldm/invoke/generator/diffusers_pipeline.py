@@ -40,6 +40,7 @@ from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
 from ldm.models.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserComponent
 from ldm.modules.textual_inversion_manager import TextualInversionManager
 
+import graphcorehacks
 
 @dataclass
 class PipelineIntermediateState:
@@ -219,7 +220,9 @@ class InvokeAIStableDiffusionPipelineOutput(StableDiffusionPipelineOutput):
     attention_map_saver: Optional[AttentionMapSaver]
 
 
-class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
+
+
+class StableDiffusionGeneratorPipeline(graphcorehacks.IPUStableDiffusionPipeline):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion.
 
@@ -463,7 +466,7 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
                                             strength,
                                             noise: torch.Tensor, run_id=None, callback=None, **extra_step_kwargs) -> InvokeAIStableDiffusionPipelineOutput:
         device = self.unet.device
-        img2img_pipeline = StableDiffusionImg2ImgPipeline(**self.components)
+        img2img_pipeline = graphcorehacks.IPUStableDiffusionImg2ImgPipeline(**self.components)
         img2img_pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps, _ = img2img_pipeline.get_timesteps(num_inference_steps, strength, device=device)
 
@@ -505,7 +508,7 @@ class StableDiffusionGeneratorPipeline(StableDiffusionPipeline):
         if init_image.dim() == 3:
             init_image = init_image.unsqueeze(0)
 
-        img2img_pipeline = StableDiffusionImg2ImgPipeline(**self.components)
+        img2img_pipeline = graphcorehacks.IPUStableDiffusionImg2ImgPipeline(**self.components)
         img2img_pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps, _ = img2img_pipeline.get_timesteps(num_inference_steps, strength, device=device)
 
