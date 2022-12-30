@@ -41,6 +41,9 @@ from ldm.models.diffusion.shared_invokeai_diffusion import InvokeAIDiffuserCompo
 from ldm.modules.textual_inversion_manager import TextualInversionManager
 
 import graphcorehacks
+import os
+from diffusers import DPMSolverMultistepScheduler
+
 
 @dataclass
 class PipelineIntermediateState:
@@ -254,6 +257,9 @@ class StableDiffusionGeneratorPipeline(graphcorehacks.IPUStableDiffusionPipeline
             Model that extracts features from generated images to be used as inputs for the `safety_checker`.
     """
 
+    pod_type = os.getenv("GRAPHCORE_POD_TYPE", "pod4")
+    executable_cache_dir = os.getenv("POPLAR_EXECUTABLE_CACHE_DIR", "/tmp/exe_cache/") + "/stablediffusion2_text2img"
+
     ID_LENGTH = 8
 
     def __init__(
@@ -266,7 +272,13 @@ class StableDiffusionGeneratorPipeline(graphcorehacks.IPUStableDiffusionPipeline
         safety_checker: Optional[StableDiffusionSafetyChecker],
         feature_extractor: Optional[CLIPFeatureExtractor],
         requires_safety_checker: bool = False,
-        precision: str = 'float32',
+        precision: str = 'float16',
+        torch_dtype=torch.float16,
+        ipu_config={
+            "matmul_proportion": [0.06, 0.1, 0.1, 0.1],
+            "executable_cache_dir": executable_cache_dir,
+        },
+        
     ):
         super().__init__(vae, text_encoder, tokenizer, unet, scheduler,
                          safety_checker, feature_extractor, requires_safety_checker)
@@ -294,6 +306,9 @@ class StableDiffusionGeneratorPipeline(graphcorehacks.IPUStableDiffusionPipeline
 
         if is_xformers_available():
             self.enable_xformers_memory_efficient_attention()
+
+        self.enable_attention_slicing()
+        self.scheduler = DPMSolverMultistepScheduler.from_config(self.scheduler.config)
 
     def image_from_embeddings(self, latents: torch.Tensor, num_inference_steps: int,
                               conditioning_data: ConditioningData,
