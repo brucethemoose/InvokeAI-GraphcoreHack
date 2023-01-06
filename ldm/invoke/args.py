@@ -687,6 +687,18 @@ class Args(object):
             action='store_true',
             help='Start InvokeAI GUI',
         )
+        web_server_group.add_argument(
+            '--ngrok',
+            type=str,
+            default=None,
+            help='Web server: Connect to ngrok using [authtoken]. Used to connect to the server with a URL.',
+        )
+        web_server_group.add_argument(
+            '--ngrok-region',
+            type=str,
+            default="us",
+            help='Web server: The region where the ngrok agent will connect to.'
+        )
         return parser
 
     # This creates the parser that processes commands on the invoke> command line
