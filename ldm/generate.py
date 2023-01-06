@@ -4,29 +4,22 @@
 # Copyright (c) 2022 Robin Rombach and Patrick Esser and contributors
 
 import gc
+import importlib
 import os
 import random
 import re
 import sys
 import time
 import traceback
-import importlib
 
 import cv2
+import diffusers
 import numpy as np
 import skimage
 import torch
 import transformers
 from PIL import Image, ImageOps
-from diffusers import HeunDiscreteScheduler
 from diffusers.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
-from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
-from diffusers.schedulers.scheduling_euler_discrete import EulerDiscreteScheduler
-from diffusers.schedulers.scheduling_ipndm import IPNDMScheduler
-from diffusers.schedulers.scheduling_lms_discrete import LMSDiscreteScheduler
-from diffusers.schedulers.scheduling_pndm import PNDMScheduler
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything, logging
 
@@ -35,17 +28,17 @@ from ldm.invoke.args import metadata_from_png
 from ldm.invoke.concepts_lib import HuggingFaceConceptsLibrary
 from ldm.invoke.conditioning import get_uc_and_c_and_ec
 from ldm.invoke.devices import choose_torch_device, choose_precision
+from ldm.invoke.generator.inpaint import infill_methods
 from ldm.invoke.globals import Globals
 from ldm.invoke.image_util import InitImageResizer
-from ldm.invoke.model_cache import ModelCache
+from ldm.invoke.model_manager import ModelManager
 from ldm.invoke.pngwriter import PngWriter
 from ldm.invoke.seamless import configure_model_padding
-from ldm.invoke.txt2mask import Txt2Mask, SegmentedGrayscale
-from ldm.invoke.generator.inpaint import infill_methods
-
+from ldm.invoke.txt2mask import Txt2Mask
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.ksampler import KSampler
 from ldm.models.diffusion.plms import PLMSSampler
+
 
 def fix_func(orig):
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -163,12 +156,12 @@ class Generate:
         mconfig             = OmegaConf.load(conf)
         self.height         = None
         self.width          = None
-        self.model_cache    = None
+        self.model_manager    = None
         self.iterations     = 1
         self.steps          = 50
         self.cfg_scale      = 7.5
         self.sampler_name   = sampler_name
-        self.ddim_eta       = 0.0    # same seed always produces same image
+        self.ddim_eta       = ddim_eta    # same seed always produces same image
         self.precision      = precision
         self.strength       = 0.75
         self.seamless       = False
@@ -210,8 +203,8 @@ class Generate:
             self.precision = choose_precision(self.device)
 
         # model caching system for fast switching
-        self.model_cache = ModelCache(mconfig,self.device,self.precision,max_loaded_models=max_loaded_models)
-        self.model_name  = model or self.model_cache.default_model() or FALLBACK_MODEL_NAME
+        self.model_manager = ModelManager(mconfig,self.device,self.precision,max_loaded_models=max_loaded_models)
+        self.model_name  = model or self.model_manager.default_model() or FALLBACK_MODEL_NAME
 
         # for VRAM usage statistics
         self.session_peakmem = torch.cuda.max_memory_allocated() if self._has_cuda else None
@@ -408,6 +401,7 @@ class Generate:
 
         if isinstance(model, DiffusionPipeline):
             configure_model_padding(model.unet, seamless, seamless_axes)
+            configure_model_padding(model.vae, seamless, seamless_axes)
         else:
             configure_model_padding(model, seamless, seamless_axes)
 
@@ -785,7 +779,7 @@ class Generate:
 
     def _make_embiggen(self):
         return self._load_generator('.embiggen','Embiggen')
-   
+
     def _make_txt2img2img(self):
         return self._load_generator('.txt2img2img','Txt2Img2Img')
 
@@ -821,7 +815,7 @@ class Generate:
             return self.model
 
         # the model cache does the loading and offloading
-        cache = self.model_cache
+        cache = self.model_manager
         if not cache.valid_model(model_name):
             print(f'** "{model_name}" is not a known model name. Please check your models.yaml file')
             return self.model
@@ -966,7 +960,7 @@ class Generate:
         return self._make_base().sample_to_lowres_estimated_image(samples)
 
     def is_legacy_model(self,model_name)->bool:
-        return self.model_cache.is_legacy(model_name)
+        return self.model_manager.is_legacy(model_name)
 
     def _set_sampler(self):
         if isinstance(self.model, DiffusionPipeline):
@@ -1007,26 +1001,28 @@ class Generate:
     def _set_scheduler(self):
         default = self.model.scheduler
 
+        # See https://github.com/huggingface/diffusers/issues/277#issuecomment-1371428672
         scheduler_map = dict(
-            ddim=DDIMScheduler,
-            dpmpp_2=DPMSolverMultistepScheduler,
-            ipndm=IPNDMScheduler,
+            ddim=diffusers.DDIMScheduler,
+            dpmpp_2=diffusers.DPMSolverMultistepScheduler,
+            k_dpm_2=diffusers.KDPM2DiscreteScheduler,
+            k_dpm_2_a=diffusers.KDPM2AncestralDiscreteScheduler,
             # DPMSolverMultistepScheduler is technically not `k_` anything, as it is neither
             # the k-diffusers implementation nor included in EDM (Karras 2022), but we can
             # provide an alias for compatibility.
-            k_dpmpp_2=DPMSolverMultistepScheduler,
-            k_euler=EulerDiscreteScheduler,
-            k_euler_a=EulerAncestralDiscreteScheduler,
-            k_heun=HeunDiscreteScheduler,
-            k_lms=LMSDiscreteScheduler,
-            plms=PNDMScheduler,
+            k_dpmpp_2=diffusers.DPMSolverMultistepScheduler,
+            k_euler=diffusers.EulerDiscreteScheduler,
+            k_euler_a=diffusers.EulerAncestralDiscreteScheduler,
+            k_heun=diffusers.HeunDiscreteScheduler,
+            k_lms=diffusers.LMSDiscreteScheduler,
+            plms=diffusers.PNDMScheduler,
         )
 
         if self.sampler_name in scheduler_map:
             sampler_class = scheduler_map[self.sampler_name]
             msg = f'>> Setting Sampler to {self.sampler_name} ({sampler_class.__name__})'
             self.sampler = sampler_class.from_pretrained(
-                self.model_cache.model_name_or_path(self.model_name),
+                self.model_manager.model_name_or_path(self.model_name),
                 subfolder="scheduler"
             )
         else:

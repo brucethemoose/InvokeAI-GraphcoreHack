@@ -241,13 +241,15 @@ class Inpaint(Img2Img):
 
         self.mask_blur_radius = mask_blur_radius
 
-        # todo: support cross-attention control
-        uc, c, _ = conditioning
-        conditioning_data = ConditioningData(uc, c, cfg_scale)
-
         # noinspection PyTypeChecker
         pipeline: StableDiffusionGeneratorPipeline = self.model
         pipeline.scheduler = sampler
+
+        # todo: support cross-attention control
+        uc, c, _ = conditioning
+        conditioning_data = (ConditioningData(uc, c, cfg_scale)
+                             .add_scheduler_args_if_applicable(pipeline.scheduler, eta=ddim_eta))
+
 
         def make_image(x_T):
             pipeline_output = pipeline.inpaint_from_embeddings(
@@ -262,7 +264,8 @@ class Inpaint(Img2Img):
 
             if pipeline_output.attention_map_saver is not None and attention_maps_callback is not None:
                 attention_maps_callback(pipeline_output.attention_map_saver)
-            result = pipeline.numpy_to_pil(pipeline_output.images)[0]
+
+            result = self.postprocess_size_and_mask(pipeline.numpy_to_pil(pipeline_output.images)[0])
 
             # Seam paint if this is our first pass (seam_size set to 0 during seam painting)
             if seam_size > 0:
@@ -293,6 +296,10 @@ class Inpaint(Img2Img):
 
     def sample_to_image(self, samples)->Image.Image:
         gen_result = super().sample_to_image(samples).convert('RGB')
+        return self.postprocess_size_and_mask(gen_result)
+
+
+    def postprocess_size_and_mask(self, gen_result: Image.Image) -> Image.Image:
         debug_image(gen_result, "gen_result", debug_status=self.enable_image_debugging)
 
         # Resize if necessary
@@ -302,7 +309,7 @@ class Inpaint(Img2Img):
         if self.pil_image is None or self.pil_mask is None:
             return gen_result
 
-        corrected_result = super().repaste_and_color_correct(gen_result, self.pil_image, self.pil_mask, self.mask_blur_radius)
+        corrected_result = self.repaste_and_color_correct(gen_result, self.pil_image, self.pil_mask, self.mask_blur_radius)
         debug_image(corrected_result, "corrected_result", debug_status=self.enable_image_debugging)
 
         return corrected_result

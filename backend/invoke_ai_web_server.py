@@ -26,6 +26,7 @@ from ldm.invoke.args import Args, APP_ID, APP_VERSION, calculate_init_img_hash
 from ldm.invoke.conditioning import get_tokens_for_prompt, get_prompt_structure
 from ldm.invoke.generator.diffusers_pipeline import PipelineIntermediateState
 from ldm.invoke.generator.inpaint import infill_methods
+from ldm.invoke.globals import Globals
 from ldm.invoke.pngwriter import PngWriter, retrieve_metadata
 from ldm.invoke.prompt_parser import split_weighted_subprompts, Blend
 
@@ -38,6 +39,9 @@ args.root_dir = os.path.expanduser(args.root_dir or "..")
 if not os.path.isabs(args.outdir):
     args.outdir = os.path.join(args.root_dir, args.outdir)
 
+# normalize the config directory relative to root
+if not os.path.isabs(opt.conf):
+    opt.conf = os.path.normpath(os.path.join(Globals.root,opt.conf))
 
 class InvokeAIWebServer:
     def __init__(self, generate: Generate, gfpgan, codeformer, esrgan) -> None:
@@ -80,7 +84,14 @@ class InvokeAIWebServer:
         }
 
         if opt.cors:
-            socketio_args["cors_allowed_origins"] = opt.cors
+            _cors = opt.cors
+            # convert list back into comma-separated string,
+            # be defensive here, not sure in what form this arrives
+            if isinstance(_cors, list):
+                _cors = ",".join(_cors)
+            if "," in _cors:
+                _cors = _cors.split(",")
+            socketio_args["cors_allowed_origins"] = _cors
 
         frontend_path = self.find_frontend()
         self.app = Flask(
@@ -292,16 +303,88 @@ class InvokeAIWebServer:
         def handle_request_capabilities():
             print(f">> System config requested")
             config = self.get_system_config()
-            config["model_list"] = self.generate.model_cache.list_models()
+            config["model_list"] = self.generate.model_manager.list_models()
             config["infill_methods"] = infill_methods()
             socketio.emit("systemConfig", config)
+
+        @socketio.on('searchForModels')
+        def handle_search_models(search_folder: str):
+            try:
+                if not search_folder:
+                    socketio.emit(
+                    "foundModels",
+                    {'search_folder': None, 'found_models': None},
+                )
+                else:
+                    search_folder, found_models = self.generate.model_manager.search_models(search_folder)
+                    socketio.emit(
+                        "foundModels",
+                        {'search_folder': search_folder, 'found_models': found_models},
+                    )
+            except Exception as e:
+                self.socketio.emit("error", {"message": (str(e))})
+                print("\n")
+
+                traceback.print_exc()
+                print("\n")
+
+        @socketio.on("addNewModel")
+        def handle_add_model(new_model_config: dict):
+            try:
+                model_name = new_model_config['name']
+                del new_model_config['name']
+                model_attributes = new_model_config
+                update = False
+                current_model_list = self.generate.model_manager.list_models()
+                if model_name in current_model_list:
+                    update = True
+
+                print(f">> Adding New Model: {model_name}")
+
+                self.generate.model_manager.add_model(
+                    model_name=model_name, model_attributes=model_attributes, clobber=True)
+                self.generate.model_manager.commit(opt.conf)
+
+                new_model_list = self.generate.model_manager.list_models()
+                socketio.emit(
+                    "newModelAdded",
+                    {"new_model_name": model_name,
+                     "model_list": new_model_list, 'update': update},
+                )
+                print(f">> New Model Added: {model_name}")
+            except Exception as e:
+                self.socketio.emit("error", {"message": (str(e))})
+                print("\n")
+
+                traceback.print_exc()
+                print("\n")
+
+        @socketio.on("deleteModel")
+        def handle_delete_model(model_name: str):
+            try:
+                print(f">> Deleting Model: {model_name}")
+                self.generate.model_manager.del_model(model_name)
+                self.generate.model_manager.commit(opt.conf)
+                updated_model_list = self.generate.model_manager.list_models()
+                socketio.emit(
+                    "modelDeleted",
+                    {"deleted_model_name": model_name,
+                     "model_list": updated_model_list},
+                )
+                print(f">> Model Deleted: {model_name}")
+            except Exception as e:
+                self.socketio.emit("error", {"message": (str(e))})
+                print("\n")
+
+                traceback.print_exc()
+                print("\n")
 
         @socketio.on("requestModelChange")
         def handle_set_model(model_name: str):
             try:
                 print(f">> Model change requested: {model_name}")
                 model = self.generate.set_model(model_name)
-                model_list = self.generate.model_cache.list_models()
+                model_list = self.generate.model_manager.list_models()
                 if model is None:
                     socketio.emit(
                         "modelChangeFailed",
@@ -713,7 +796,7 @@ class InvokeAIWebServer:
 
     # App Functions
     def get_system_config(self):
-        model_list: dict = self.generate.model_cache.list_models()
+        model_list: dict = self.generate.model_manager.list_models()
         active_model_name = None
 
         for model_name, model_dict in model_list.items():
@@ -850,9 +933,7 @@ class InvokeAIWebServer:
                 init_img_path = self.get_image_path_from_url(init_img_url)
                 generation_parameters["init_img"] = Image.open(init_img_path).convert('RGB')
 
-            def image_progress(progress_state: PipelineIntermediateState):
-                step = progress_state.step
-                sample = progress_state.latents
+            def image_progress(sample, step):
                 if self.canceled.is_set():
                     raise CanceledException
 
@@ -1123,9 +1204,16 @@ class InvokeAIWebServer:
 
             print(generation_parameters)
 
+            def diffusers_step_callback_adapter(*cb_args, **kwargs):
+                if isinstance(cb_args[0], PipelineIntermediateState):
+                    progress_state: PipelineIntermediateState = cb_args[0]
+                    return image_progress(progress_state.latents, progress_state.step)
+                else:
+                    return image_progress(*cb_args, **kwargs)
+
             self.generate.prompt2image(
                 **generation_parameters,
-                step_callback=image_progress,
+                step_callback=diffusers_step_callback_adapter,
                 image_callback=image_done
             )
 

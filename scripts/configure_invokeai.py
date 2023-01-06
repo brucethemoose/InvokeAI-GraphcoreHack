@@ -40,10 +40,10 @@ import torch
 transformers.logging.set_verbosity_error()
 
 try:
-    from ldm.invoke.model_cache import ModelCache
+    from ldm.invoke.model_manager import ModelManager
 except ImportError:
     sys.path.append('.')
-    from ldm.invoke.model_cache import ModelCache
+    from ldm.invoke.model_manager import ModelManager
 
 #--------------------------globals-----------------------
 Model_dir = 'models'
@@ -169,7 +169,7 @@ will be given the option to view and change your selections.
                     counter += 1
         else:
             for ds in Datasets.keys():
-                if Datasets[ds]['recommended']:
+                if Datasets[ds].get('recommended',False):
                     datasets[ds]=counter
                     counter += 1
 
@@ -193,7 +193,7 @@ will be given the option to view and change your selections.
 def recommended_datasets()->dict:
     datasets = dict()
     for ds in Datasets.keys():
-        if Datasets[ds]['recommended']:
+        if Datasets[ds].get('recommended',False):
             datasets[ds]=True
     return datasets
 
@@ -343,6 +343,8 @@ def _download_repo_or_file(mconfig:DictConfig, access_token:str, precision:str='
         path = _download_ckpt_weights(mconfig, access_token)
     else:
         path = _download_diffusion_weights(mconfig, access_token, precision=precision)
+        if 'vae' in mconfig and 'repo_id' in mconfig['vae']:
+            _download_diffusion_weights(mconfig['vae'], access_token, precision=precision)
     return path
 
 def _download_ckpt_weights(mconfig:DictConfig, access_token:str)->Path:
@@ -358,7 +360,7 @@ def _download_ckpt_weights(mconfig:DictConfig, access_token:str)->Path:
 
 def _download_diffusion_weights(mconfig:DictConfig, access_token:str, precision:str='float32'):
     repo_id = mconfig['repo_id']
-    model_class = StableDiffusionGeneratorPipeline if mconfig['format']=='diffusers' else AutoencoderKL
+    model_class = StableDiffusionGeneratorPipeline if mconfig.get('format',None)=='diffusers' else AutoencoderKL
     extra_arg_list = [{'revision':'fp16'},{}] if precision=='float16' else [{}]
     path = None
     for extra_args in extra_arg_list:
