@@ -16,15 +16,16 @@ import textwrap
 import time
 import traceback
 import warnings
+import shutil
 from pathlib import Path
 from typing import Union, Any
+from ldm.util import download_with_progress_bar
 
 import torch
 import transformers
 from diffusers import AutoencoderKL, logging as dlogging
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
-from omegaconf.errors import ConfigAttributeError
 from picklescan.scanner import scan_file_path
 
 from ldm.invoke.generator.diffusers_pipeline import StableDiffusionGeneratorPipeline
@@ -33,7 +34,7 @@ from ldm.util import instantiate_from_config, ask_user
 
 DEFAULT_MAX_MODELS=2
 
-class ModelCache(object):
+class ModelManager(object):
     def __init__(self, config:OmegaConf, device_type:str, precision:str, max_loaded_models=DEFAULT_MAX_MODELS):
         '''
         Initialize with the path to the models.yaml config file,
@@ -98,7 +99,7 @@ class ModelCache(object):
                 assert self.current_model,'** FATAL: no current model to restore to'
                 print(f'** restoring {self.current_model}')
                 self.get_model(self.current_model)
-                return
+                return None
 
         self.current_model = model_name
         self._push_newest_model(model_name)
@@ -121,7 +122,7 @@ class ModelCache(object):
     def set_default_model(self,model_name:str) -> None:
         '''
         Set the default model. The change will not take
-        effect until you call model_cache.commit()
+        effect until you call model_manager.commit()
         '''
         assert model_name in self.models,f"unknown model '{model_name}'"
 
@@ -132,45 +133,51 @@ class ModelCache(object):
 
     def model_info(self, model_name:str)->dict:
         '''
-        Given a model name returns the config object describing it.
+        Given a model name returns the OmegaConf (dict-like) object describing it.
         '''
         if model_name not in self.config:
             return None
         return self.config[model_name]
+
+    def model_names(self)->list[str]:
+        '''
+        Return a list consisting of all the names of models defined in models.yaml
+        '''
+        return list(self.config.keys())
 
     def is_legacy(self,model_name:str)->bool:
         '''
         Return true if this is a legacy (.ckpt) model
         '''
         info = self.model_info(model_name)
-        return info['format']=='ckpt' if info else False
+        if 'weights' in info and info['weights'].endswith('.ckpt'):
+            return True
+        return False
 
     def list_models(self) -> dict:
         '''
         Return a dict of models in the format:
         { model_name1: {'status': ('active'|'cached'|'not loaded'),
                         'description': description,
+                        'format': ('ckpt'|'diffusers'|'vae'),
                        },
           model_name2: { etc }
+        Please use model_manager.models() to get all the model names,
+        model_manager.model_info('model-name') to get the stanza for the model
+        named 'model-name', and model_manager.config to get the full OmegaConf
+        object derived from models.yaml
         '''
         models = {}
         for name in self.config:
-            try:
-                description = self.config[name].description
-            except ConfigAttributeError:
-                description = '<no description>'
+            stanza = self.config[name]
+            format = stanza.get('format','diffusers')
+            config = stanza.get('config','no config')
+            models[name] = dict(
+                description = stanza.get('description',None),
+                format = 'vae' if 'VAE/default' in config else format,
+                status = 'active' if self.current_model == name else 'cached' if name is self.models else 'not loaded',
+            )
 
-            if self.current_model == name:
-                status = 'active'
-            elif name in self.models:
-                status = 'cached'
-            else:
-                status = 'not loaded'
-
-            models[name]={
-                'status' : status,
-                'description' : description
-            }
         return models
 
     def print_models(self) -> None:
@@ -179,7 +186,9 @@ class ModelCache(object):
         '''
         models = self.list_models()
         for name in models:
-            line = f'{name:25s} {models[name]["status"]:>10s}  {models[name]["description"]}'
+            if models[name]['format'] == 'vae':
+                continue
+            line = f'{name:25s} {models[name]["status"]:>10s}  {models[name]["format"]:10s} {models[name]["description"]}'
             if models[name]['status'] == 'active':
                 line = f'\033[1m{line}\033[0m'
             print(line)
@@ -214,6 +223,8 @@ class ModelCache(object):
 
         config = omega[model_name] if model_name in omega else {}
         for field in model_attributes:
+            if field == 'weights':
+                field.replace('\\', '/')
             config[field] = model_attributes[field]
 
         omega[model_name] = config
@@ -294,6 +305,9 @@ class ModelCache(object):
         # merged models from auto11 merge board are flat for some reason
         if 'state_dict' in sd:
             sd = sd['state_dict']
+
+        print(f'   | Forcing garbage collection prior to loading new model')
+        gc.collect()
         model = instantiate_from_config(omega_config.model)
         model.load_state_dict(sd, strict=False)
 
@@ -414,8 +428,6 @@ class ModelCache(object):
             return path
         elif 'repo_id' in mconfig:
             return mconfig['repo_id']
-        elif 'repo_name' in mconfig:
-            return mconfig['repo_name']
         else:
             raise ValueError("Model config must specify either repo_id or path.")
 
@@ -460,6 +472,83 @@ class ModelCache(object):
         else:
             print('>> Model scanned ok!')
 
+    def import_diffuser_model(self,
+                        repo_or_path:Union[str,Path],
+                        model_name:str=None,
+                        description:str=None,
+                        commit_to_conf:Path=None,
+                        )->bool:
+        '''
+        Attempts to install the indicated diffuser model and returns True if successful.
+
+        "repo_or_path" can be either a repo-id or a path-like object corresponding to the
+        top of a downloaded diffusers directory.
+
+        You can optionally provide a model name and/or description. If not provided,
+        then these will be derived from the repo name. If you provide a commit_to_conf
+        path to the configuration file, then the new entry will be committed to the
+        models.yaml file.
+        '''
+        model_name = model_name or Path(repo_or_path).stem
+        description = description or f'imported diffusers model {model_name}'
+        new_config = dict(
+            description=description,
+            format='diffusers',
+        )
+        if isinstance(repo_or_path,Path) and repo_or_path.exists():
+            new_config.update(path=repo_or_path)
+        else:
+            new_config.update(repo_id=repo_or_path)
+
+        self.add_model(model_name, new_config, True)
+        if commit_to_conf:
+            self.commit(commit_to_conf)
+        return True
+
+    def import_ckpt_model(self,
+                    weights:Union[str,Path],
+                    config:Union[str,Path]='configs/stable-diffusion/v1-inference.yaml',
+                    model_name:str=None,
+                    model_description:str=None,
+                    commit_to_conf:Path=None,
+    )->bool:
+        '''
+        Attempts to install the indicated ckpt file and returns True if successful.
+
+        "weights" can be either a path-like object corresponding to a local .ckpt file 
+        or a http/https URL pointing to a remote model.
+
+        "config" is the model config file to use with this ckpt file. It defaults to
+        v1-inference.yaml. If a URL is provided, the config will be downloaded.
+        
+        You can optionally provide a model name and/or description. If not provided,
+        then these will be derived from the weight file name. If you provide a commit_to_conf
+        path to the configuration file, then the new entry will be committed to the
+        models.yaml file.
+        '''
+        weights_path = self._resolve_path(weights,'models/ldm/stable-diffusion-v1')
+        config_path  = self._resolve_path(config,'configs/stable-diffusion')
+
+        if weights_path is None or not weights_path.exists():
+            return False
+        if config_path is None or not config_path.exists():
+            return False
+            
+        model_name = model_name or Path(weights).stem
+        model_description = model_description or f'imported stable diffusion weights file {model_name}'
+        new_config = dict(
+            weights=str(weights_path),
+            config=str(config_path),
+            description=model_description,
+            format='ckpt',
+            width=512,
+            height=512
+        )
+        self.add_model(model_name, new_config, True)
+        if commit_to_conf:
+            self.commit(commit_to_conf)
+        return True
+                       
     def autoconvert_weights(
             self,
             conf_path:Path,
@@ -492,36 +581,48 @@ class ModelCache(object):
             self.convert_and_import(ckpt, ckpt_files[ckpt])
         self.commit(conf_path)
 
-    def convert_and_import(self, ckpt_path:Path, diffuser_path:Path)->dict:
+    def convert_and_import(self,
+                           ckpt_path:Path,
+                           diffuser_path:Path,
+                           model_name=None,
+                           model_description=None,
+                           commit_to_conf:Path=None,
+    )->dict:
         '''
         Convert a legacy ckpt weights file to diffuser model and import
         into models.yaml.
         '''
+        new_config = None
         from ldm.invoke.ckpt_to_diffuser import convert_ckpt_to_diffuser
         import transformers
         if diffuser_path.exists():
             print(f'ERROR: The path {str(diffuser_path)} already exists. Please move or remove it and try again.')
             return
 
-        print(f'>> {ckpt_path.name}: optimizing (30-60s).')
+        model_name = model_name or diffuser_path.name
+        model_description = model_description or 'Optimized version of {model_name}'
+        print(f'>> {model_name}: optimizing (30-60s).')
         try:
-            model_name = diffuser_path.name
             verbosity =transformers.logging.get_verbosity()
             transformers.logging.set_verbosity_error()
-            convert_ckpt_to_diffuser(ckpt_path, diffuser_path)
+            convert_ckpt_to_diffuser(ckpt_path, diffuser_path,extract_ema=True)
             transformers.logging.set_verbosity(verbosity)
             print(f'>> Success. Optimized model is now located at {str(diffuser_path)}')
             print(f'>> Writing new config file entry for {model_name}...',end='')
             new_config = dict(
                 path=str(diffuser_path),
-                description=f'Optimized version of {model_name}',
+                description=model_description,
                 format='diffusers',
             )
+            self.del_model(model_name)
             self.add_model(model_name, new_config, True)
-            print('done.')
+            if commit_to_conf:
+                self.commit(commit_to_conf)
         except Exception as e:
             print(f'** Conversion failed: {str(e)}')
             traceback.print_exc()
+            
+        print('done.')
         return new_config
 
     def del_config(self, model_name:str, gen, opt, completer):
@@ -529,10 +630,26 @@ class ModelCache(object):
         if model_name == current_model:
             print("** Can't delete active model. !switch to another model first. **")
             return
-        gen.model_cache.del_model(model_name)
-        gen.model_cache.commit(opt.conf)
+        gen.model_manager.del_model(model_name)
+        gen.model_manager.commit(opt.conf)
         print(f'** {model_name} deleted')
         completer.del_model(model_name)
+
+    def search_models(self, search_folder):
+
+        print(f'>> Finding Models In: {search_folder}')
+        models_folder = Path(search_folder).glob('**/*.ckpt')
+
+        files = [x for x in models_folder if x.is_file()]
+
+        found_models = []
+        for file in files:
+            found_models.append({
+                'name': file.stem,
+                'location': str(file.resolve()).replace('\\', '/')
+            })
+
+        return search_folder, found_models
 
     def _make_cache_room(self) -> None:
         num_loaded_models = len(self.models)
@@ -552,6 +669,8 @@ class ModelCache(object):
         Write current configuration out to the indicated file.
         '''
         yaml_str = OmegaConf.to_yaml(self.config)
+        if not os.path.isabs(config_file_path):
+            config_file_path = os.path.normpath(os.path.join(Globals.root,config_file_path))
         tmpfile = os.path.join(os.path.dirname(config_file_path),'new_config.tmp')
         with open(tmpfile, 'w') as outfile:
             outfile.write(self.preamble())
@@ -571,6 +690,21 @@ class ModelCache(object):
             # and the width and height of the images it
             # was trained on.
         ''')
+
+    def _resolve_path(self, source:Union[str,Path], dest_directory:str)->Path:
+        resolved_path = None
+        if source.startswith('http'):
+            basename = os.path.basename(source)
+            if not os.path.isabs(dest_directory):
+                dest_directory = os.path.join(Globals.root,dest_directory)
+            dest = os.path.join(dest_directory,basename)
+            if download_with_progress_bar(source,dest):
+                resolved_path = Path(dest)
+        else:
+            if not os.path.isabs(source):
+                source = os.path.join(Globals.root,source)
+            resolved_path = Path(source)
+        return resolved_path
 
     def _invalidate_cached_model(self,model_name:str) -> None:
         self.offload_model(model_name)
@@ -675,6 +809,10 @@ class ModelCache(object):
         vae = None
         deferred_error = None
 
+        # A VAE may be in a subfolder of a model's repository.
+        if 'subfolder' in vae_config:
+            vae_args['subfolder'] = vae_config['subfolder']
+
         for fp_args in fp_args_list:
             # At some point we might need to be able to use different classes here? But for now I think
             # all Stable Diffusion VAE are AutoencoderKL.
@@ -690,9 +828,5 @@ class ModelCache(object):
 
         if not vae and deferred_error:
             print(f'** Could not load VAE {name_or_path}: {str(deferred_error)}')
-
-        # comment by lstein: I don't know what this does
-        if 'subfolder' in vae_config:
-            vae_args['subfolder'] = vae_config['subfolder']
 
         return vae
